@@ -379,6 +379,13 @@ if(APPLE)
         "${DILIGENT_CORE_BUILD_DIR}/ThirdParty/SPIRV-Cross/libspirv-cross-core.a"
         "${DILIGENT_CORE_BUILD_DIR}/ThirdParty/volk/libvolk.a"
         "${DILIGENT_CORE_BUILD_DIR}/ThirdParty/xxHash/build/cmake/libxxhash.a"
+        "${DILIGENT_CORE_BUILD_DIR}/ThirdParty/SPIRV-Tools/source/libSPIRV-Tools.a"
+        "${DILIGENT_CORE_BUILD_DIR}/ThirdParty/SPIRV-Tools/source/opt/libSPIRV-Tools-opt.a"
+        "${DILIGENT_CORE_BUILD_DIR}/ThirdParty/glslang/glslang/libglslang.a"
+        "${DILIGENT_CORE_BUILD_DIR}/ThirdParty/glslang/SPIRV/libSPIRV.a"
+        "${DILIGENT_CORE_BUILD_DIR}/ThirdParty/glslang/glslang/libMachineIndependent.a"
+        "${DILIGENT_CORE_BUILD_DIR}/ThirdParty/glslang/glslang/OSDependent/Unix/libOSDependent.a"
+        "${DILIGENT_CORE_BUILD_DIR}/ThirdParty/glslang/glslang/libGenericCodeGen.a"
         /opt/homebrew/lib/libvulkan.dylib
         "-framework AppKit"
         "-framework QuartzCore"
