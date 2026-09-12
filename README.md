@@ -123,7 +123,13 @@ cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
 # 3. 编译应用
 cmake --build build --parallel
 
-# 4. 运行弥勒佛场景（开启原生 64-bit 原子深度与 MSL 覆写优化）
+# 4. 运行弥勒佛场景
+# 【情况 A：Apple M1 机器】
+# M1 芯片硬件（Apple Family 7）原生不支持 64 位整数原子指令，使用高兼容性的便携 32 位双 Pass 模式即可全速运行：
+NANITE_NATIVE_64BIT_VISIBILITY=0 NANITE_GPU_TIMINGS=1 open build/DiligentCoreVulkanDemo.app
+
+# 【情况 B：Apple M2 / M3 / M4 机器】
+# M2 及以上芯片（Apple Family 8+，如 M4 MacBook）原生支持 64 位硬件原子操作，可开启 MSL 覆写优化：
 DILIGENT_MSL_OVERRIDE_DIR="$PWD/Shaders/Nanite/msl" \
 NANITE_NATIVE_64BIT_VISIBILITY=1 \
 NANITE_GPU_TIMINGS=1 \
