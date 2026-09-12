@@ -2,7 +2,7 @@
 
 本项目是一个在 **Apple Silicon (macOS Metal / MoltenVK Vulkan)** 上，使用底层系统级语言（**C++17 / Objective-C++ / HLSL / Metal Shading Language**）从零构建的 **仿 Unreal Engine 5 Nanite 的 GPU-Driven 虚拟化几何体（Virtualized Geometry）渲染管线**。
 
-通过基于 MoltenVK 的 Vulkan 跨平台图形 API 以及针对 Apple GPU 架构深度调优的手写 Metal 着色器，本项目在 Mac M系列芯片上实现了海量微多边形的高帧率实时渲染。
+通过基于 MoltenVK 的 Vulkan 跨平台图形 API 以及针对 Apple GPU 硬件特性的手写 Metal MSL 扩展，本项目在 Mac M 系列芯片上实现了海量微多边形的高帧率实时渲染。
 
 ---
 
@@ -23,7 +23,7 @@
 4. **混合光栅化（Hardware + Software Rasterization）与 Visibility Buffer**
    - **大三角形硬件光栅**：大图元通过 Vulkan ExecuteIndirect 提交至硬件光栅化器。
    - **微多边形软光栅**：亚像素级微多边形分流至 Compute Shader 软件光栅器（`NaniteSoftRasterDepth.hlsl`），彻底解决传统硬件光栅管线渲染 sub-pixel 三角形时的过绘制与 quad-overdraw 开销。
-   - **Apple Metal 原生 64-bit 原子深度写入**：针对 Apple Silicon 定制手写 MSL 内核，通过单次 `atomic_max_explicit` 写入 `[depth:payload]` 64位压缩缓冲，规避标准 Vulkan 在缺少 64-bit 原子操作时的双 Pass 开销。
+   - **Apple Metal 原生 64-bit 原子深度写入（关键底层 Patch）**：详见下方关于底层补丁的专项说明。
 
 5. **材质解析与延迟着色（Material Resolve & Deferred Shading）**
    - 屏幕空间仅输出精简的 Visibility Buffer（写入 Packed Instance/Cluster/Triangle ID 与深度）。
@@ -35,102 +35,138 @@
 
 ---
 
-## 目录结构
+## 核心底层 Patch：支持 Apple Silicon 64-bit 硬件原子操作
+
+在 `patches/0001-vulkan-msl-shader-module-override.patch` 中包含了一个至关重要的底层修改。
+
+### 为什么需要这个 Patch？
+1. **Nanite Visibility Buffer 的核心机制**：软光栅和 Visibility Buffer 依赖于一个 64-bit 原子操作，即使用 `atomic_max_explicit` 将 `[32-bit Depth : 32-bit Payload(Instance+Cluster+Triangle ID)]` 作为一个 64 位无符号整数一次性写入原子缓冲，从而保证深度测试与可见性标识的原子写入。
+2. **SPIRV-Cross 与 MoltenVK 的局限**：
+   - 标准 Vulkan 规范要求设备具备全套 64 位原子算术指令（Add/CAS/Exchange/Min/Max）才能置位 `shaderBufferInt64Atomics=1`。然而 Apple M 系列硬件原生只提供了 Min/Max 指令，导致 MoltenVK 只能向 Vulkan 报告该特性不支持（为 0）。
+   - SPIRV-Cross 在将带有 64 位原子操作的 SPIR-V 编译到 Metal Shading Language (MSL) 时，会直接报错拒绝：`"MSL currently does not support 64-bit atomics"`。
+3. **Patch 解决方案**：
+   - 该补丁修改了 `DiligentCore` 的 Vulkan 后端（`PipelineStateVkImpl.cpp`）。
+   - 当环境变量 `DILIGENT_MSL_OVERRIDE_DIR` 指向本项目手写的 MSL 目录（`Shaders/Nanite/msl`）时，DiligentCore 绕过 SPIRV-Cross 的翻译，通过 MoltenVK 私有接口魔数 `kMVKMagicNumberMSLSourceCode` 直接把手写 Metal 源码喂给底层 MoltenVK。
+   - 借助手写 MSL，项目直接调用 Apple Silicon 芯片硬件原生的 `atomic_max_explicit(..., memory_order_relaxed)`，从而消除常规 32-bit 回退方案中必须进行的二次 coverage 遍历开销！
+
+---
+
+## 完整编译与运行指南 (macOS Apple Silicon)
+
+以下步骤经过验证，任何人克隆该仓库后均可成功编译并运行：
+
+### 1. 准备同级目录结构
+
+建议创建一个工作根目录（例如 `operater-dev`），让项目与依赖库保持如下相对路径结构：
 
 ```text
-.
-├── CMakeLists.txt              # 构建系统（支持 macOS MoltenVK 与 Windows DX12/Vulkan）
-├── Assets/                     # 3D 模型资产目录（内置斯坦福弥勒佛 happy_vrip.ply 等）
-├── DemoRenderer.hpp / .cpp     # 核心渲染主循环、管线调度与帧时序统计
-├── NaniteGpuScene.hpp / .cpp   # GPU 场景资源管理、Cluster 缓冲、HZB 与剔除 Dispatch 调度
-├── NaniteModel.hpp / .cpp      # 模型加载、ClusterLOD 离线生成与 .nanite 二进制缓存
-├── NanitePipelines.hpp / .cpp  # Vulkan Pipeline State 状态机与资源绑定
-├── NaniteTypes.hpp             # 几何结构体、GPU 节点、Cluster、剔除常量定义
-├── main.mm                     # macOS Cocoa 原生窗口、CAMetalLayer 与 UI 控制面板
-├── main_win32.cpp              # Windows 平台入口
-├── Shaders/
-│   └── Nanite/                 # HLSL Compute / Vertex / Pixel 着色器源码及 MSL 原生内核
-├── patches/                    # DiligentCore MoltenVK MSL 覆盖补丁
-├── test/                       # 体积云（Volumetric Cloud）等衍生特效测试套件
-└── tools/                      # MSL 编译与着色器验证工具
+operater-dev/
+├── DiligentCore/             # 图形底座引擎 (打好 patch 并编译)
+├── References/
+│   └── meshoptimizer/        # 离线 Cluster 网格简化库
+└── nanite-moltenvk/          # 本项目
 ```
 
----
-
-## 依赖与环境准备
-
-在 macOS (Apple Silicon) 上编译并运行本项目需要以下组件：
-
-1. **Homebrew 基础开发工具**：
-   ```sh
-   brew install cmake ninja glslang
-   ```
-2. **Vulkan / MoltenVK 运行时**：
-   ```sh
-   brew install molten-vk vulkan-headers vulkan-loader
-   ```
-   确保 `/opt/homebrew/lib/libvulkan.dylib` 存在。
-
-3. **引擎依赖 (DiligentCore)**：
-   - 项目基于开源轻量图形库 `DiligentCore` 作为底座。
-   - 在上级目录克隆并编译 Vulkan 后端：
-     ```sh
-     git clone https://github.com/DiligentGraphics/DiligentCore.git ../DiligentCore
-     cmake -S ../DiligentCore -B ../DiligentCore/build-vulkan-github -G Ninja \
-           -DCMAKE_BUILD_TYPE=Release \
-           -DDILIGENT_BUILD_VULKAN=ON \
-           -DDILIGENT_BUILD_METAL=OFF \
-           -DDILIGENT_BUILD_OPENGL=OFF
-     cmake --build ../DiligentCore/build-vulkan-github --parallel
-     ```
-   - 如需启用手写 Metal 64-bit 原子深度优化，可按需应用 `patches/0001-vulkan-msl-shader-module-override.patch`。
-
-4. **网格优化算法库 (meshoptimizer)**：
-   - 依赖带 `clusterlod.h` 的 meshoptimizer 仓库：
-     ```sh
-     git clone https://github.com/zeux/meshoptimizer.git ../References/meshoptimizer
-     ```
-
-5. **3D 扫描资产**：
-   - 弥勒佛模型已经内置于 `Assets/happy_vrip.ply`（Stanford 3D Scanning Repository）。
-   - 首次加载大网格时会自动计算 ClusterLOD 分层并导出 `.nanite` 缓存，后续启动实现秒开。
-
----
-
-## 编译与运行 (macOS)
+### 2. 安装系统依赖
 
 ```sh
-# 1. 配置并生成构建文件
+brew install cmake ninja glslang molten-vk vulkan-headers vulkan-loader git-lfs
+git lfs install
+```
+
+### 3. 克隆并编译 DiligentCore（应用 64 位原子 Patch）
+
+```sh
+cd /path/to/operater-dev
+
+# 克隆官方 DiligentCore 并切到推荐基础 commit
+git clone https://github.com/DiligentGraphics/DiligentCore.git
+cd DiligentCore
+git checkout b402aefa3
+
+# 应用 MSL 源码级覆写补丁（解锁 Apple 64-bit 原子特性）
+git apply ../nanite-moltenvk/patches/0001-vulkan-msl-shader-module-override.patch
+
+# 编译 DiligentCore 的 Vulkan 静态库
+cmake -S . -B build-vulkan-github -G Ninja \
+      -DCMAKE_BUILD_TYPE=Release \
+      -DDILIGENT_BUILD_VULKAN=ON \
+      -DDILIGENT_BUILD_METAL=OFF \
+      -DDILIGENT_BUILD_OPENGL=OFF \
+      -DDILIGENT_NO_HLSL=ON \
+      -DDILIGENT_BUILD_SAMPLES=OFF \
+      -DDILIGENT_BUILD_DEMOS=OFF \
+      -DDILIGENT_BUILD_TESTS=OFF
+
+cmake --build build-vulkan-github --parallel
+```
+
+### 4. 克隆 meshoptimizer
+
+```sh
+cd /path/to/operater-dev
+mkdir -p References
+git clone https://github.com/zeux/meshoptimizer.git References/meshoptimizer
+```
+
+### 5. 编译与运行本项目
+
+```sh
+cd /path/to/operater-dev/nanite-moltenvk
+
+# 1. 确保 Git LFS 已完整拉取弥勒佛模型
+git lfs pull
+
+# 2. 生成构建工程
 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
 
-# 2. 编译可执行程序
+# 3. 编译应用
 cmake --build build --parallel
 
-# 3. 运行应用程序
+# 4. 运行弥勒佛场景（开启原生 64-bit 原子深度与 MSL 覆写优化）
+DILIGENT_MSL_OVERRIDE_DIR="$PWD/Shaders/Nanite/msl" \
+NANITE_NATIVE_64BIT_VISIBILITY=1 \
+NANITE_GPU_TIMINGS=1 \
 open build/DiligentCoreVulkanDemo.app
 ```
 
-运行后会打开主渲染视窗以及独立的 `Nanite Controls` 控制面板。可通过 UI 面板调整模型实例规模、切换 HZB 遮挡剔除开关、监控逻辑三角形总数（Logical Triangles）、可见 Cluster 数量以及微秒级 GPU 各 Pass 耗时。
+---
+
+## 常用环境变量调优参数
+
+| 环境变量 | 默认值 | 作用说明 |
+| :--- | :--- | :--- |
+| `DILIGENT_MSL_OVERRIDE_DIR` | 无 | 指向 `Shaders/Nanite/msl`，激活 Patch 的手写 Metal 内核覆写 |
+| `NANITE_NATIVE_64BIT_VISIBILITY` | 0 | 设为 `1` 启用单 Pass 原生 64-bit 原子 Visibility Buffer |
+| `NANITE_MODEL` | `happy_vrip.ply` | 场景加载模型，默认加载斯坦福弥勒佛（41MB） |
+| `NANITE_SCENE` | 默认矩阵 | 设为 `coastal` 切换至多材质雪山群峰场景 |
+| `NANITE_GPU_TIMINGS` | 0 | 设为 `1` 在窗口标题栏实时打印各 GPU Pass 纳秒/毫秒耗时 |
+| `NANITE_DISABLE_HZB` | 0 | 设为 `1` 强制关闭 HZB 遮挡剔除，用于性能 A/B 对比 |
+| `NANITE_VISUALIZE_HZB` | 0 | 设为 `1` 在渲染窗口中可视化当前帧 HZB 金字塔 Mipmap |
+| `NANITE_STRESS_TRIANGLES` | 0 | 开启海量复制压测（例如设为 `1000000000` 渲染 10 亿逻辑面） |
 
 ---
 
-## 常用调试与调优环境变量
+## 目录索引
 
-| 环境变量 | 说明 |
-| :--- | :--- |
-| `NANITE_MODEL` | 指定加载的模型路径（默认加载 `happy_vrip.ply` 弥勒佛） |
-| `NANITE_SCENE=coastal` | 切换至海滨地貌群山多材质测试场景 |
-| `NANITE_GPU_TIMINGS=1` | 在窗口标题栏实时打印各 GPU Pass（剔除、光栅化、HZB构建）耗时 |
-| `NANITE_NATIVE_64BIT_VISIBILITY=1` | 启用针对 Apple GPU 优化的手写 Metal 64位原子深度软件光栅化 |
-| `NANITE_DISABLE_HZB=1` | 强制关闭 HZB 剔除，用于性能基准对照 |
-| `NANITE_VISUALIZE_HZB=1` | 在视窗中可视化当前 HZB 深度金字塔各 Mipmap 级别 |
-| `NANITE_VISUALIZE_DEPTH=1` | 在视窗中可视化原始深度图 |
-| `NANITE_CLUSTER_RASTER_EXPERIMENT=1` | 启用 Cluster 级别的软硬光栅化阈值分流实验 |
-| `NANITE_CLUSTER_RASTER_AREA=256` | 软硬件光栅化分流的屏幕面积阈值（像素） |
-| `NANITE_STRESS_TRIANGLES=1000000000` | 开启十亿级逻辑面数的可扩展性压力测试模式 |
+```text
+.
+├── CMakeLists.txt              # 主构建脚本
+├── Assets/                     # 3D 资产（内置弥勒佛 happy_vrip.ply 与 stanford_bunny.obj）
+├── DemoRenderer.hpp / .cpp     # 渲染主循环、GPU 时序查询与视锥摄像机管理
+├── NaniteGpuScene.hpp / .cpp   # GPU 场景资源管理、Cluster 缓冲、两阶段剔除调度
+├── NaniteModel.hpp / .cpp      # PLY/OBJ 解析、ClusterLOD 离线生成与 .nanite 序列化缓存
+├── NanitePipelines.hpp / .cpp  # Vulkan Pipeline State 状态机与资源绑定布局
+├── NaniteTypes.hpp             # 几何、DAG 节点、Cluster、剔除常量结构定义
+├── main.mm                     # macOS Cocoa 窗口、CAMetalLayer 桥接与 ImGui 控制面板
+├── Shaders/Nanite/             # HLSL 着色器源码 (Cull, Raster, HZB, Shading)
+│   └── msl/                    # 手写 Metal 原生内核 (供 Patch 覆写注入)
+├── patches/                    # DiligentCore 底层 64-bit 原子支持补丁
+└── test/                       # 体积云（Volumetric Cloud）等模块化测试代码
+```
 
 ---
 
 ## 许可证
 
-本项目基于 MIT 许可证开源。内置模型资产来源于 Stanford 3D Scanning Repository。
+本项目遵循 MIT 开源许可证。内置模型来源于 Stanford Computer Graphics Laboratory 3D Scanning Repository。
