@@ -1,0 +1,22 @@
+# Build outputs
+build/
+build-*/
+*.app/
+*.dSYM/
+*.o
+*.obj
+*.spv
+
+# Dependencies & temporary caches
+*.nanite
+.ninja_deps
+.ninja_log
+CMakeCache.txt
+CMakeFiles/
+
+# OS & IDE
+.DS_Store
+*.swp
+*.swo
+.vscode/
+.idea/

@@ -1,0 +1,211 @@
+diff --git a/Graphics/GraphicsEngineVulkan/src/PipelineStateVkImpl.cpp b/Graphics/GraphicsEngineVulkan/src/PipelineStateVkImpl.cpp
+index 40bcabca8..8c0ae1b4a 100644
+--- a/Graphics/GraphicsEngineVulkan/src/PipelineStateVkImpl.cpp
++++ b/Graphics/GraphicsEngineVulkan/src/PipelineStateVkImpl.cpp
+@@ -32,6 +32,17 @@
+ #include <array>
+ #include <unordered_map>
+ 
++#if PLATFORM_MACOS || PLATFORM_IOS || PLATFORM_TVOS
++#    include <cctype>
++#    include <cstdio>
++#    include <cstdlib>
++#    include <cstring>
++#    include <mutex>
++#    include <set>
++#    include <string>
++#    include <dlfcn.h>
++#endif
++
+ #include "RenderDeviceVkImpl.hpp"
+ #include "DeviceContextVkImpl.hpp"
+ #include "ShaderVkImpl.hpp"
+@@ -55,6 +66,151 @@ constexpr INTERFACE_ID PipelineStateVkImpl::IID_InternalImpl;
+ namespace
+ {
+ 
++#if PLATFORM_MACOS || PLATFORM_IOS || PLATFORM_TVOS
++
++// Metal Shading Language override, a debug facility for the Apple platforms.
++//
++// MoltenVK accepts MSL source in place of SPIR-V when the module blob starts with
++// the magic number kMVKMagicNumberMSLSourceCode (see mvk_private_api.h). That is the
++// only way to reach Metal features SPIRV-Cross refuses to emit - 64-bit
++// atomic_max_explicit above all, which it rejects outright with "MSL currently does
++// not support 64-bit atomics".
++//
++// When DILIGENT_MSL_OVERRIDE_DIR names a directory containing <ShaderName>.metal
++// (non-alphanumeric characters in the name replaced by '_'), that file is handed to
++// vkCreateShaderModule instead of the compiled SPIR-V. Reflection, resource
++// signatures and the pipeline layout still come from the SPIR-V, so the override has
++// to keep the same interface; the [[buffer(n)]] / [[texture(n)]] indices it must use
++// are the ones MoltenVK itself picks, which MVK_CONFIG_SHADER_DUMP_DIR will print.
++//
++// Requires MVK_CONFIG_USE_METAL_ARGUMENT_BUFFERS=0: with argument buffers on, a
++// descriptor set arrives as one Metal argument buffer and individual bindings have no
++// buffer index of their own.
++//
++// Recognised directives, anywhere in the file:
++//   // MVK_WORKGROUP_SIZE x y z   compute only, and mandatory there - MSL carries no
++//                                equivalent of SPIR-V's LocalSize execution mode
++//   // MVK_ENTRY_POINT name       defaults to main0, since MSL cannot name a
++//                                function 'main'
++struct MslOverride
++{
++    std::vector<Uint8> Blob;                // magic number + source + '\0'
++    std::string        EntryPoint = "main0";
++    std::array<Uint32, 3> WorkgroupSize{0, 0, 0};
++};
++
++// The loader does not forward vkSetWorkgroupSizeMVK, so it cannot be linked. Asking
++// dlopen for the ICD by name returns the image the loader already brought in rather
++// than a second copy, so the handle refers to the MoltenVK that owns the module.
++using PFN_SetWorkgroupSizeMVK = void(VKAPI_PTR*)(VkShaderModule, Uint32, Uint32, Uint32);
++
++PFN_SetWorkgroupSizeMVK GetSetWorkgroupSizeMVK()
++{
++    static PFN_SetWorkgroupSizeMVK Fn = []() -> PFN_SetWorkgroupSizeMVK {
++        if (void* pSym = dlsym(RTLD_DEFAULT, "vkSetWorkgroupSizeMVK"))
++            return reinterpret_cast<PFN_SetWorkgroupSizeMVK>(pSym);
++        for (const char* Path : {"libMoltenVK.dylib", "/opt/homebrew/lib/libMoltenVK.dylib"})
++        {
++            if (void* pHandle = dlopen(Path, RTLD_NOW | RTLD_GLOBAL))
++            {
++                if (void* pSym = dlsym(pHandle, "vkSetWorkgroupSizeMVK"))
++                    return reinterpret_cast<PFN_SetWorkgroupSizeMVK>(pSym);
++            }
++        }
++        return nullptr;
++    }();
++    return Fn;
++}
++
++// VkPipelineShaderStageCreateInfo::pName is read when the pipeline is created, which
++// is after the override object is gone, so the name has to outlive it. A set never
++// moves its elements, and the number of distinct names is bounded by the number of
++// overridden shaders.
++const char* InternEntryPointName(const std::string& Name)
++{
++    static std::mutex           Mtx;
++    static std::set<std::string> Names;
++
++    std::lock_guard<std::mutex> Lock{Mtx};
++    return Names.insert(Name).first->c_str();
++}
++
++std::unique_ptr<MslOverride> LoadMslOverride(const char* ShaderName, SHADER_TYPE ShaderType)
++{
++    const char* OverrideDir = std::getenv("DILIGENT_MSL_OVERRIDE_DIR");
++    if (OverrideDir == nullptr || OverrideDir[0] == '\0' || ShaderName == nullptr)
++        return {};
++
++    // Hand-written kernels declare explicit [[buffer(n)]] indices. With Metal
++    // argument buffers enabled those indices no longer correspond to the reflected
++    // descriptor bindings, so using the override would create a valid-looking PSO
++    // with invalid resource addresses. Refuse the override unless the caller has
++    // explicitly selected the compatible MoltenVK mode. The Nanite demo sets this
++    // before device creation when its native 64-bit path is requested.
++    const char* UseArgumentBuffers = std::getenv("MVK_CONFIG_USE_METAL_ARGUMENT_BUFFERS");
++    if (UseArgumentBuffers == nullptr || std::strcmp(UseArgumentBuffers, "0") != 0)
++    {
++        LOG_WARNING_MESSAGE("Skipping MSL override for shader '", ShaderName,
++                            "': set MVK_CONFIG_USE_METAL_ARGUMENT_BUFFERS=0 for explicit Metal bindings.");
++        return {};
++    }
++
++    std::string FileName;
++    for (const char* c = ShaderName; *c != '\0'; ++c)
++        FileName += (std::isalnum(static_cast<unsigned char>(*c)) != 0) ? *c : '_';
++    const std::string Path = std::string{OverrideDir} + "/" + FileName + ".metal";
++
++    std::FILE* pFile = std::fopen(Path.c_str(), "rb");
++    if (pFile == nullptr)
++        return {};
++
++    std::fseek(pFile, 0, SEEK_END);
++    const long Size = std::ftell(pFile);
++    std::fseek(pFile, 0, SEEK_SET);
++    std::string Source(static_cast<size_t>(std::max(Size, 0L)), '\0');
++    const size_t Read = std::fread(Source.data(), 1, Source.size(), pFile);
++    std::fclose(pFile);
++    Source.resize(Read);
++
++    auto Override = std::make_unique<MslOverride>();
++
++    // The blob is the 4-byte magic number, the source, and the terminator, with
++    // codeSize covering all three.
++    constexpr Uint32 MagicNumberMSLSourceCode = 0x19960412;
++    Override->Blob.resize(sizeof(MagicNumberMSLSourceCode) + Source.size() + 1);
++    std::memcpy(Override->Blob.data(), &MagicNumberMSLSourceCode, sizeof(MagicNumberMSLSourceCode));
++    std::memcpy(Override->Blob.data() + sizeof(MagicNumberMSLSourceCode), Source.data(), Source.size());
++    Override->Blob.back() = 0;
++
++    if (const size_t Pos = Source.find("MVK_ENTRY_POINT"); Pos != std::string::npos)
++    {
++        char Name[128] = {};
++        if (std::sscanf(Source.c_str() + Pos, "MVK_ENTRY_POINT %127s", Name) == 1)
++            Override->EntryPoint = Name;
++    }
++    if (const size_t Pos = Source.find("MVK_WORKGROUP_SIZE"); Pos != std::string::npos)
++    {
++        std::sscanf(Source.c_str() + Pos, "MVK_WORKGROUP_SIZE %u %u %u",
++                    &Override->WorkgroupSize[0], &Override->WorkgroupSize[1], &Override->WorkgroupSize[2]);
++    }
++
++    if (ShaderType == SHADER_TYPE_COMPUTE && Override->WorkgroupSize[0] == 0)
++    {
++        LOG_ERROR_AND_THROW("MSL override '", Path, "' is a compute shader but declares no "
++                            "'// MVK_WORKGROUP_SIZE x y z'. MSL carries no workgroup size, so it "
++                            "has to be stated explicitly.");
++    }
++    if (GetSetWorkgroupSizeMVK() == nullptr && Override->WorkgroupSize[0] != 0)
++        LOG_ERROR_AND_THROW("MSL override '", Path, "' needs vkSetWorkgroupSizeMVK, which could not "
++                            "be resolved from MoltenVK.");
++
++    LOG_INFO_MESSAGE("Using MSL override '", Path, "' for shader '", ShaderName,
++                     "' (entry point '", Override->EntryPoint, "'), in place of its SPIR-V.");
++    return Override;
++}
++
++#endif // Apple platforms
++
+ void InitPipelineShaderStages(const VulkanUtilities::LogicalDevice&              LogicalDevice,
+                               const PipelineStateVkImpl::TShaderStages&          ShaderStages,
+                               std::vector<VulkanUtilities::ShaderModuleWrapper>& ShaderModules,
+@@ -81,10 +237,35 @@ void InitPipelineShaderStages(const VulkanUtilities::LogicalDevice&
+             ShaderModuleCI.codeSize = SPIRV.size() * sizeof(uint32_t);
+             ShaderModuleCI.pCode    = SPIRV.data();
+ 
++            StageCI.pName = pShader->GetEntryPoint();
++
++#if PLATFORM_MACOS || PLATFORM_IOS || PLATFORM_TVOS
++            // The blob only has to live until vkCreateShaderModule copies it, but the
++            // entry point name is read later, when the pipeline is created, so that
++            // one is interned rather than borrowed.
++            std::unique_ptr<MslOverride> Override =
++                LoadMslOverride(pShader->GetDesc().Name, Stage.Type);
++            if (Override)
++            {
++                ShaderModuleCI.codeSize = Override->Blob.size();
++                ShaderModuleCI.pCode    = reinterpret_cast<const uint32_t*>(Override->Blob.data());
++                StageCI.pName           = InternEntryPointName(Override->EntryPoint);
++            }
++#endif
++
+             ShaderModules.push_back(LogicalDevice.CreateShaderModule(ShaderModuleCI, pShader->GetDesc().Name));
+ 
++#if PLATFORM_MACOS || PLATFORM_IOS || PLATFORM_TVOS
++            if (Override && Override->WorkgroupSize[0] != 0)
++            {
++                GetSetWorkgroupSizeMVK()(ShaderModules.back(),
++                                         Override->WorkgroupSize[0],
++                                         Override->WorkgroupSize[1],
++                                         Override->WorkgroupSize[2]);
++            }
++#endif
++
+             StageCI.module              = ShaderModules.back();
+-            StageCI.pName               = pShader->GetEntryPoint();
+             StageCI.pSpecializationInfo = nullptr;
+ 
+             Stages.push_back(StageCI);
